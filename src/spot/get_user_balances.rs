@@ -18,6 +18,8 @@ pub async fn get_user_balances(user_address: &str) -> anyhow::Result<Balances> {
         .text()
         .await?;
 
+    println!("{}", res);
+
     let balances: Balances = serde_json::from_str(&res)?;
 
     Ok(balances)
