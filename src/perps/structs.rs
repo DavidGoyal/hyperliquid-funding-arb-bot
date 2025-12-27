@@ -1,5 +1,11 @@
 use serde::Deserialize;
 
+pub struct TokenDetails {
+    pub name: String,
+    pub asset_id: u32,
+    pub sz_decimals: u8,
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Positions {
