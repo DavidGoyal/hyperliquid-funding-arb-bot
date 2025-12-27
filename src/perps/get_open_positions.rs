@@ -18,8 +18,6 @@ pub async fn get_open_positions(user_address: &str) -> anyhow::Result<Positions>
         .text()
         .await?;
 
-    println!("{}", res);
-
     let positions: Positions = serde_json::from_str(&res)?;
 
     Ok(positions)

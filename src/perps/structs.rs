@@ -4,6 +4,7 @@ use serde::Deserialize;
 #[serde(rename_all = "camelCase")]
 pub struct Positions {
     pub asset_positions: Vec<AssetPosition>,
+    pub withdrawable: String,
 }
 
 #[derive(Deserialize, Debug)]
