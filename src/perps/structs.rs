@@ -1,5 +1,6 @@
 use serde::Deserialize;
 
+#[derive(Debug)]
 pub struct TokenDetails {
     pub name: String,
     pub asset_id: u32,

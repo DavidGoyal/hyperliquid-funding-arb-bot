@@ -1,6 +1,7 @@
+use chrono::{FixedOffset, Timelike, Utc};
 use dotenvy::dotenv;
 use std::time::Duration;
-use tokio::time::interval;
+use tracing::{debug, info, instrument, warn};
 
 use crate::{
     perps::{
@@ -21,9 +22,54 @@ mod place_order;
 mod sign_action;
 mod spot;
 
+const TARGET_MINUTE: u32 = 28;
+const BUY_AMOUNT: f64 = 25.0;
+
+/// Calculates the duration until the next target minute (:29) in IST
+fn duration_until_next_target() -> Duration {
+    // IST is UTC+5:30
+    let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+    let now_ist = Utc::now().with_timezone(&ist);
+
+    let current_minute = now_ist.minute();
+    let current_second = now_ist.second();
+
+    let minutes_until_target = if current_minute < TARGET_MINUTE {
+        TARGET_MINUTE - current_minute
+    } else {
+        // Next hour's :29
+        60 - current_minute + TARGET_MINUTE
+    };
+
+    // Calculate total seconds, subtracting current seconds within the minute
+    let total_seconds = (minutes_until_target * 60) as i64 - current_second as i64;
+
+    // If we're exactly at :29:00, wait for next hour
+    let total_seconds = if total_seconds <= 0 {
+        total_seconds + 3600
+    } else {
+        total_seconds
+    };
+
+    Duration::from_secs(total_seconds as u64)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize tracing subscriber with environment filter
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .init();
+
     dotenv().ok();
+
+    info!("Starting HL arbitrage bot");
 
     let spot_tokens = vec![
         SpotTokenDetails {
@@ -92,31 +138,26 @@ async fn main() -> anyhow::Result<()> {
     let user_address = std::env::var("WALLET_ADDRESS").expect("WALLET_ADDRESS must be set");
     let user_private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
 
-    let mut interval = interval(Duration::from_secs(10));
-
     loop {
-        interval.tick().await;
+        let wait_duration = duration_until_next_target();
+        let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+        let now_ist = Utc::now().with_timezone(&ist);
+        info!(
+            current_time_ist = %now_ist.format("%H:%M:%S"),
+            wait_seconds = wait_duration.as_secs(),
+            "Waiting until next :{TARGET_MINUTE} IST"
+        );
+
+        tokio::time::sleep(wait_duration).await;
+
+        let now_ist = Utc::now().with_timezone(&ist);
+        info!(
+            current_time_ist = %now_ist.format("%H:%M:%S"),
+            "--- Tick: checking for opportunities ---"
+        );
 
         let spot_user_balances = get_user_balances(&user_address).await?;
         let perp_open_positions = get_open_positions(&user_address).await?;
-
-        let usdc_balance = spot_user_balances
-            .balances
-            .iter()
-            .find(|balance| balance.coin == "USDC");
-
-        let mut spot_balance = 0.0;
-        if usdc_balance.is_some() {
-            spot_balance = usdc_balance.unwrap().total.parse::<f64>().unwrap();
-        }
-
-        let perp_balance = perp_open_positions.withdrawable.parse::<f64>().unwrap();
-
-        let mut available_to_trade = if spot_balance > perp_balance {
-            perp_balance
-        } else {
-            spot_balance
-        };
 
         for i in 0..perp_open_positions.asset_positions.len() {
             let perp_token = &perp_open_positions.asset_positions[i].position.coin;
@@ -151,8 +192,38 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
 
-        if available_to_trade < 11.0 {
-            println!("Available to trade is less than 11.0");
+        let spot_user_balances = get_user_balances(&user_address).await?;
+        let perp_open_positions = get_open_positions(&user_address).await?;
+
+        let usdc_balance = spot_user_balances
+            .balances
+            .iter()
+            .find(|balance| balance.coin == "USDC");
+
+        let mut spot_balance = 0.0;
+        if usdc_balance.is_some() {
+            spot_balance = usdc_balance.unwrap().total.parse::<f64>().unwrap();
+        }
+
+        let perp_balance = perp_open_positions.withdrawable.parse::<f64>().unwrap();
+
+        debug!(
+            spot_balance = spot_balance,
+            perp_balance = perp_balance,
+            "Retrieved user balances"
+        );
+
+        let mut available_to_trade = if spot_balance > perp_balance {
+            perp_balance
+        } else {
+            spot_balance
+        };
+
+        if available_to_trade < BUY_AMOUNT {
+            warn!(
+                available_to_trade = available_to_trade,
+                "Available to trade is less than {BUY_AMOUNT}, skipping this cycle"
+            );
             continue;
         }
 
@@ -169,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+#[instrument(skip(user_private_key), fields(token = %spot_token.name.as_str()))]
 async fn close_wrong_arb(
     spot_token: &SpotTokenDetails,
     perp_token: &PerpTokenDetails,
@@ -185,10 +257,13 @@ async fn close_wrong_arb(
 
     if perp_mark_px < spot_mark_px {
         // long on perp, sell on spot
-        println!(
-            "Closing wrong arb for {} and {}",
-            spot_token.name, perp_token.name
+        info!(
+            token = %spot_token.name,
+            perp_mark_px = perp_mark_px,
+            spot_mark_px = spot_mark_px,
+            "Closing wrong arb position"
         );
+        debug!("Placing buy order on perp to close position");
         place_order(
             user_private_key,
             perp_mark_px,
@@ -201,6 +276,7 @@ async fn close_wrong_arb(
         )
         .await?;
 
+        debug!("Placing sell order on spot to close position");
         place_order(
             user_private_key,
             spot_mark_px,
@@ -212,11 +288,14 @@ async fn close_wrong_arb(
             true,
         )
         .await?;
+
+        info!("Successfully closed wrong arb position");
     }
 
     Ok(())
 }
 
+#[instrument(skip(user_private_key), fields(token = %spot_token.name.as_str(), available_to_trade = *available_to_trade))]
 async fn check_arb_opportunities(
     spot_token: &SpotTokenDetails,
     perp_token: &PerpTokenDetails,
@@ -224,8 +303,12 @@ async fn check_arb_opportunities(
     user_address: &str,
     user_private_key: &str,
 ) -> anyhow::Result<()> {
-    if *available_to_trade < 11.0 {
-        println!("Available to trade is less than 11.0");
+    if *available_to_trade < BUY_AMOUNT {
+        debug!(
+            available_to_trade = *available_to_trade,
+            token = %spot_token.name,
+            "Available to trade is less than {BUY_AMOUNT}, skipping"
+        );
         return Ok(());
     }
 
@@ -235,13 +318,27 @@ async fn check_arb_opportunities(
     let perp_mark_px = perp_token_info.mark_px.parse::<f64>().unwrap();
     let spot_mark_px = spot_token_info.mark_px.parse::<f64>().unwrap();
 
+    debug!(
+        perp_mark_px = perp_mark_px,
+        spot_mark_px = spot_mark_px,
+        price_diff = perp_mark_px - spot_mark_px,
+        "Checking arbitrage opportunity"
+    );
+
     if perp_mark_px > spot_mark_px {
         // short on perp, long on spot
+        info!(
+            perp_mark_px = perp_mark_px,
+            spot_mark_px = spot_mark_px,
+            price_diff = perp_mark_px - spot_mark_px,
+            amount = BUY_AMOUNT,
+            "Arbitrage opportunity found: short perp, long spot"
+        );
         place_order(
             user_private_key,
             perp_mark_px,
             "sell",
-            11.0,
+            BUY_AMOUNT,
             perp_token.asset_id,
             perp_token.sz_decimals,
             6 - perp_token.sz_decimals,
@@ -253,7 +350,7 @@ async fn check_arb_opportunities(
             user_private_key,
             spot_mark_px,
             "buy",
-            11.0,
+            BUY_AMOUNT,
             10000 + spot_token.asset_id,
             spot_token.sz_decimals,
             8 - spot_token.sz_decimals,
@@ -261,7 +358,11 @@ async fn check_arb_opportunities(
         )
         .await?;
 
-        *available_to_trade -= 11.0;
+        *available_to_trade -= BUY_AMOUNT;
+        info!(
+            remaining_available = *available_to_trade,
+            "Order placed successfully, remaining available to trade"
+        );
     }
 
     Ok(())

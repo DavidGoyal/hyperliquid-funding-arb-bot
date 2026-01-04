@@ -1,6 +1,7 @@
 use chrono::Utc;
 use rust_decimal::Decimal;
 use std::str::FromStr;
+use tracing::{debug, error, info, instrument};
 
 use crate::sign_action::{ExchangePayload, Limit, Order, OrderType, SignAction, sign_action};
 
@@ -28,6 +29,7 @@ fn price_to_wire(x: f64, max_decimals: u8) -> String {
     decimal.normalize().to_string()
 }
 
+#[instrument(skip(private_key), fields(side = %side, asset_id = asset_id, amount = amount, mark_px = mark_px))]
 pub async fn place_order(
     private_key: &str,
     mark_px: f64,
@@ -45,6 +47,16 @@ pub async fn place_order(
     } else {
         mark_px * 0.99
     };
+
+    debug!(
+        side = side,
+        asset_id = asset_id,
+        amount = amount,
+        mark_px = mark_px,
+        limit_px = limit_px,
+        is_opposite = is_opposite,
+        "Preparing order"
+    );
 
     let nonce = current_time as u64;
     let expires_after = nonce + 10000;
@@ -86,6 +98,7 @@ pub async fn place_order(
 
     let payload_json = serde_json::to_string(&payload)?;
 
+    debug!("Sending order to exchange");
     let res = client
         .post("https://api.hyperliquid.xyz/exchange")
         .header("Content-Type", "application/json")
@@ -95,10 +108,22 @@ pub async fn place_order(
         .text()
         .await?;
 
-    println!("{}", res);
     if res.contains("ok") {
-        return Ok(());
+        info!(
+            side = side,
+            asset_id = asset_id,
+            amount = amount,
+            limit_px = limit_px,
+            "Order placed successfully"
+        );
+        Ok(())
     } else {
-        return Err(anyhow::anyhow!("Failed to place order: {}", res));
+        error!(
+            side = side,
+            asset_id = asset_id,
+            response = %res,
+            "Failed to place order"
+        );
+        Err(anyhow::anyhow!("Failed to place order: {}", res))
     }
 }
